@@ -1,5 +1,9 @@
 #!/bin/bash
 
+set -o nounset
+set -o errexit
+# set -o xtrace
+
 # make sure we have dependencies
 hash vagrant 2>/dev/null || { echo >&2 "ERROR: vagrant not found.  Aborting."; exit 1; }
 hash VBoxManage 2>/dev/null || { echo >&2 "ERROR: VBoxManage not found.  Aborting."; exit 1; }
@@ -18,14 +22,18 @@ else
   exit 1
 fi
 
-set -o nounset
-set -o errexit
-set -o xtrace
+if [ "$OSTYPE" = "linux-gnu" ]; then
+  SED="$(which sed) -r"
+  MD5="md5sum"
+elif [ "$OSTYPE" = "msys" ]; then
+  SED="$(which sed) -r"
+  MD5="md5 -l"
+else
+  SED="$(which sed) -E"
+  MD5="md5 -q"
+fi
 
 # Configurations
-BOX="debian-jessie"
-ISO_URL="http://cdimage.debian.org/debian-cd/8.2.0/amd64/iso-cd/debian-8.2.0-amd64-netinst.iso"
-ISO_MD5="762eb3dfc22f85faf659001ebf270b4f"
 
 # location, location, location
 FOLDER_BASE=$(pwd)
@@ -34,6 +42,34 @@ FOLDER_BUILD="${FOLDER_BASE}/build"
 FOLDER_VBOX="${FOLDER_BUILD}/vbox"
 FOLDER_ISO_CUSTOM="${FOLDER_BUILD}/iso/custom"
 FOLDER_ISO_INITRD="${FOLDER_BUILD}/iso/initrd"
+
+# Env option: architecture (i386 or amd64)
+ARCH=${ARCH:-amd64}
+
+# Env option: Debian CD image mirror; default is http://cdimage.debian.org/debian-cd/
+DEBIAN_CDIMAGE=${DEBIAN_CDIMAGE:-cdimage.debian.org}
+DEBIAN_CDIMAGE_URL="http://${DEBIAN_CDIMAGE}/debian-cd/"
+# Check if the Debian version is set manually (ie. DEBVER="8.4.0") or use the latest version
+if [ -z ${DEBVER+x} ]; then
+  DEBVER=$(curl -sS ${DEBIAN_CDIMAGE_URL} | grep -E ">[0-9]+\.[0-9]\.[0-9]/<" | ${SED} 's/.*>([0-9]+\.[0-9]\.[0-9])\/<.*/\1/')
+  echo "Detected latest Debian version \"$DEBVER\" from $DEBIAN_CDIMAGE_URL"
+else
+  echo "Using Debian version \"$DEBVER\""
+fi
+
+# Env option: the vagrant box name; default is debian-jessie-$ARCH
+BOX=${BOX:-debian-jessie-${ARCH}}
+
+ISO_FILE="debian-${DEBVER}-${ARCH}-netinst.iso"
+ISO_BASEURL="${DEBIAN_CDIMAGE_URL}${DEBVER}/${ARCH}/iso-cd"
+ISO_URL="${ISO_BASEURL}/${ISO_FILE}"
+ISO_MD5=$(curl -sS ${ISO_BASEURL}/MD5SUMS | grep ${ISO_FILE} | cut -f1 -d" ")
+
+if [ "$ARCH" = "amd64" ]; then
+  VBOX_OSTYPE=Debian_64
+else
+  VBOX_OSTYPE=Debian
+fi
 
 # Env option: Use headless mode or GUI
 VM_GUI="${VM_GUI:-}"
@@ -45,7 +81,7 @@ fi
 STOPVM="VBoxManage controlvm ${BOX} poweroff"
 
 # Env option: Use custom preseed.cfg or default
-DEFAULT_PRESEED="preseed.cfg"
+DEFAULT_PRESEED="${FOLDER_BASE}/preseed.cfg"
 PRESEED="${PRESEED:-"$DEFAULT_PRESEED"}"
 
 # Env option: Use custom late_command.sh or default
@@ -57,14 +93,6 @@ if [[ "$VBOX_VERSION" < 4.3 ]]; then
   PORTCOUNT="--sataportcount 1"
 else
   PORTCOUNT="--portcount 1"
-fi
-
-if [ "$OSTYPE" = "linux-gnu" ]; then
-  MD5="md5sum"
-elif [ "$OSTYPE" = "msys" ]; then
-  MD5="md5 -l"
-else
-  MD5="md5 -q"
 fi
 
 # start with a clean slate
@@ -97,7 +125,7 @@ mkdir -p "${FOLDER_VBOX}"
 mkdir -p "${FOLDER_ISO_CUSTOM}"
 mkdir -p "${FOLDER_ISO_INITRD}"
 
-ISO_FILENAME="${FOLDER_ISO}/`basename ${ISO_URL}`"
+ISO_FILENAME="${FOLDER_ISO}/${ISO_FILE}"
 INITRD_FILENAME="${FOLDER_ISO}/initrd.gz"
 
 # download the installation disk if you haven't already or it is corrupted somehow
@@ -158,7 +186,7 @@ if [ ! -e "${FOLDER_ISO}/custom.iso" ]; then
   cd "${FOLDER_BASE}"
   chmod u+w "${FOLDER_ISO_CUSTOM}/isolinux" "${FOLDER_ISO_CUSTOM}/isolinux/isolinux.cfg"
   rm "${FOLDER_ISO_CUSTOM}/isolinux/isolinux.cfg"
-  cp isolinux.cfg "${FOLDER_ISO_CUSTOM}/isolinux/isolinux.cfg"
+  cp ${FOLDER_BASE}/isolinux.cfg "${FOLDER_ISO_CUSTOM}/isolinux/isolinux.cfg"
   chmod u+w "${FOLDER_ISO_CUSTOM}/isolinux/isolinux.bin"
 
   # add late_command script
@@ -167,7 +195,7 @@ if [ ! -e "${FOLDER_ISO}/custom.iso" ]; then
   cp "${LATE_CMD}" "${FOLDER_ISO_CUSTOM}/late_command.sh"
 
   echo "Running mkisofs ..."
-  "$MKISOFS" -r -V "Custom Debian Install CD" \
+  "$MKISOFS" -r -V "Custom Debian $DEBVER $ARCH CD" \
     -cache-inodes -quiet \
     -J -l -b isolinux/isolinux.bin \
     -c isolinux/boot.cat -no-emul-boot \
@@ -175,12 +203,12 @@ if [ ! -e "${FOLDER_ISO}/custom.iso" ]; then
     -o "${FOLDER_ISO}/custom.iso" "${FOLDER_ISO_CUSTOM}"
 fi
 
-echo "Creating VM Box..."
 # create virtual machine
 if ! VBoxManage showvminfo "${BOX}" >/dev/null 2>&1; then
+  echo "Creating VM Box ${BOX}..."
   VBoxManage createvm \
     --name "${BOX}" \
-    --ostype Debian_64 \
+    --ostype "${VBOX_OSTYPE}" \
     --register \
     --basefolder "${FOLDER_VBOX}"
 
@@ -242,8 +270,17 @@ if ! VBoxManage showvminfo "${BOX}" >/dev/null 2>&1; then
     --medium emptydrive
 fi
 
-echo "Building Vagrant Box ..."
+echo "Building Vagrant Box ${BOX}..."
 vagrant package --base "${BOX}" --output "${BOX}.box"
+
+if [ -d "${FOLDER_BUILD}" ]; then
+  echo "Cleaning build directory ..."
+  chmod -R u+w "${FOLDER_BUILD}"
+  rm -rf "${FOLDER_BUILD}"
+fi
+
+echo "DONE. To add ${BOX}.box with name debian-jessie into vagrant, just run:"
+echo "vagrant box add \"debian-jessie\" ${BOX}.box"
 
 # references:
 # http://blog.ericwhite.ca/articles/2009/11/unattended-debian-lenny-install/
